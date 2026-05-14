@@ -1,0 +1,20 @@
+# Go
+server/bin/
+server/*.out
+
+# Node
+web/node_modules/
+web/dist/
+web/.vite/
+web/*.local
+web/tsconfig.tsbuildinfo
+
+# Editor
+.idea/
+.vscode/
+.DS_Store
+
+# Env
+*.env
+.env.*
+!.env.example
