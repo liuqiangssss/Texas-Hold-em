@@ -11,23 +11,40 @@ function App() {
 
   useEffect(() => {
     const off = socket.on((msg: ServerMsg) => {
+      const store = useSession.getState();
       switch (msg.type) {
         case 'login_ok':
-          useSession.getState().setLogin(msg.user_id, msg.nickname);
+          store.setLogin(msg.user_id, msg.nickname);
           break;
         case 'table_state':
-          useSession
-            .getState()
-            .applyTableState(msg.table_id, msg.blinds, msg.seats, msg.your_seat);
+          store.applyTableState(msg);
           break;
         case 'hand_start':
-          useSession.getState().applyHandStart(msg.hand_id, msg.dealer_msg);
+          store.applyHandStart(msg.hand_id, msg.dealer_msg, msg.button);
+          break;
+        case 'hand_end':
+          store.applyHandEnd();
           break;
         case 'deal_hole':
-          useSession.getState().applyHole(msg.cards);
+          store.applyHole(msg.cards);
+          break;
+        case 'deal_community':
+          store.applyCommunity(msg.cards);
+          break;
+        case 'action_applied':
+          store.applyAction(msg.seat, msg.action, msg.amount, msg.stack, msg.bet);
+          break;
+        case 'to_act':
+          store.applyToAct({ seat: msg.seat, toCall: msg.to_call, minRaise: msg.min_raise });
+          break;
+        case 'pot_update':
+          store.applyPot(msg.pots, msg.total);
+          break;
+        case 'showdown':
+          store.applyShowdown(msg.winners, msg.reveals ?? {}, msg.community);
           break;
         case 'error':
-          useSession.getState().setError(`${msg.code}: ${msg.message}`);
+          store.setError(`${msg.code}: ${msg.message}`);
           break;
       }
     });

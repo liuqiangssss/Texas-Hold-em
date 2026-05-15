@@ -133,7 +133,7 @@ func (s *clientSession) reader(ctx context.Context) error {
 			p := &table.Player{
 				UserID:   s.userID,
 				Nickname: s.nickname,
-				Stack:    1000, // MVP: fixed 100 BB at 5/10
+				Stack:    100 * req.Blinds[1], // MVP: 100 BB buy-in
 				Send:     s.sendCh,
 			}
 			if ok := t.Sit(p); !ok {
@@ -141,6 +141,18 @@ func (s *clientSession) reader(ctx context.Context) error {
 				continue
 			}
 			s.table = t
+
+		case proto.MsgAction:
+			if s.table == nil {
+				s.sendError("not_at_table", "sit at a table first")
+				continue
+			}
+			var req proto.ActionReq
+			if err := json.Unmarshal(data, &req); err != nil {
+				s.sendError("bad_frame", "action payload invalid")
+				continue
+			}
+			s.table.Action(s.userID, req.HandID, req.Action, req.Amount)
 
 		default:
 			s.sendError("unknown_type", string(env.Type))

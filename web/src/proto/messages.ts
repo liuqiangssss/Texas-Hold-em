@@ -4,11 +4,34 @@ export type MsgType =
   | 'login'
   | 'login_ok'
   | 'sit'
+  | 'action'
   | 'table_state'
   | 'hand_start'
+  | 'hand_end'
   | 'deal_hole'
   | 'deal_community'
+  | 'action_applied'
+  | 'to_act'
+  | 'pot_update'
+  | 'showdown'
   | 'error';
+
+export type ActionType =
+  | 'fold'
+  | 'check'
+  | 'call'
+  | 'bet'
+  | 'raise'
+  | 'all_in'
+  | 'post_blind';
+
+export type Stage =
+  | 'waiting'
+  | 'preflop'
+  | 'flop'
+  | 'turn'
+  | 'river'
+  | 'showdown';
 
 export interface Envelope {
   type: MsgType;
@@ -32,11 +55,23 @@ export interface SitReq extends Envelope {
   blinds: [number, number];
 }
 
+export interface ActionReq extends Envelope {
+  type: 'action';
+  hand_id: string;
+  action: ActionType;
+  amount?: number;
+}
+
 export interface SeatInfo {
   seat: number;
   user_id: string;
   nickname: string;
   stack: number;
+  bet: number;
+  committed: number;
+  folded: boolean;
+  all_in: boolean;
+  sitting_out: boolean;
 }
 
 export interface TableState extends Envelope {
@@ -48,7 +83,12 @@ export interface TableState extends Envelope {
   hand_id?: string;
   community?: string[];
   pot?: number;
-  stage?: string;
+  stage?: Stage;
+  button: number;
+  to_act: number;
+  last_bet: number;
+  min_raise: number;
+  time_left_ms?: number;
 }
 
 export interface HandStart extends Envelope {
@@ -69,8 +109,61 @@ export interface DealHole extends Envelope {
 export interface DealCommunity extends Envelope {
   type: 'deal_community';
   hand_id: string;
-  stage: string;
+  stage: Stage;
   cards: string[];
+}
+
+export interface ActionApplied extends Envelope {
+  type: 'action_applied';
+  hand_id: string;
+  seat: number;
+  action: ActionType;
+  amount: number;
+  stack: number;
+  bet: number;
+}
+
+export interface ToActMsg extends Envelope {
+  type: 'to_act';
+  hand_id: string;
+  seat: number;
+  time_left_ms: number;
+  min_raise: number;
+  to_call: number;
+}
+
+export interface PotInfo {
+  amount: number;
+  eligible: number[];
+}
+
+export interface PotUpdate extends Envelope {
+  type: 'pot_update';
+  hand_id: string;
+  pots: PotInfo[];
+  total: number;
+}
+
+export interface WinnerInfo {
+  seat: number;
+  amount: number;
+  hand_rank?: string;
+  best5?: string[];
+}
+
+export interface ShowdownMsg extends Envelope {
+  type: 'showdown';
+  hand_id: string;
+  community: string[];
+  reveals?: Record<number, string[]>;
+  winners: WinnerInfo[];
+}
+
+export interface HandEndMsg extends Envelope {
+  type: 'hand_end';
+  hand_id: string;
+  reason: string;
+  next_in_ms: number;
 }
 
 export interface ErrorMsg extends Envelope {
@@ -79,5 +172,16 @@ export interface ErrorMsg extends Envelope {
   message: string;
 }
 
-export type ServerMsg = LoginOK | TableState | HandStart | DealHole | DealCommunity | ErrorMsg;
-export type ClientMsg = LoginReq | SitReq;
+export type ServerMsg =
+  | LoginOK
+  | TableState
+  | HandStart
+  | HandEndMsg
+  | DealHole
+  | DealCommunity
+  | ActionApplied
+  | ToActMsg
+  | PotUpdate
+  | ShowdownMsg
+  | ErrorMsg;
+export type ClientMsg = LoginReq | SitReq | ActionReq;

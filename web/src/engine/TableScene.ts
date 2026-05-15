@@ -1,5 +1,5 @@
 import { Application, Container, Graphics, Text, TextStyle } from 'pixi.js';
-import type { SeatInfo } from '../proto/messages';
+import type { SeatInfo, WinnerInfo } from '../proto/messages';
 
 const SEAT_POSITIONS: Array<{ xRatio: number; yRatio: number }> = [
   { xRatio: 0.5, yRatio: 0.88 },  // 0 - self (bottom center)
@@ -16,9 +16,12 @@ export class TableScene {
   private seatLayer: Container;
   private communityLayer: Container;
   private holeLayer: Container;
+  private revealLayer: Container;
   private holeCards: Graphics[] = [];
 
   private yourSeat = -1;
+  private button = -1;
+  private toActSeat = -1;
 
   constructor(canvas: HTMLCanvasElement) {
     this.app = new Application({
@@ -33,14 +36,14 @@ export class TableScene {
     this.root = new Container();
     this.app.stage.addChild(this.root);
 
-    // Table felt oval.
     const felt = new Graphics();
     this.root.addChild(felt);
 
     this.seatLayer = new Container();
     this.communityLayer = new Container();
     this.holeLayer = new Container();
-    this.root.addChild(this.seatLayer, this.communityLayer, this.holeLayer);
+    this.revealLayer = new Container();
+    this.root.addChild(this.seatLayer, this.communityLayer, this.holeLayer, this.revealLayer);
 
     this.drawFelt(felt);
     this.app.renderer.on('resize', () => this.drawFelt(felt));
@@ -52,6 +55,14 @@ export class TableScene {
 
   setYourSeat(seat: number): void {
     this.yourSeat = seat;
+  }
+
+  setButton(seat: number): void {
+    this.button = seat;
+  }
+
+  setToAct(seat: number): void {
+    this.toActSeat = seat;
   }
 
   renderSeats(seats: SeatInfo[]): void {
@@ -66,31 +77,48 @@ export class TableScene {
       const cx = w * pos.xRatio;
       const cy = h * pos.yRatio;
 
+      const isToAct = s.seat === this.toActSeat;
+      const isButton = s.seat === this.button;
+
       const chip = new Graphics();
-      chip.beginFill(0x1d2545);
-      chip.lineStyle(2, 0x4f7cff, 1);
-      chip.drawRoundedRect(-70, -26, 140, 52, 10);
+      const borderColor = isToAct ? 0xffd54f : s.folded ? 0x404040 : 0x4f7cff;
+      const fillColor = s.folded ? 0x141414 : 0x1d2545;
+      chip.beginFill(fillColor, s.folded ? 0.6 : 1);
+      chip.lineStyle(isToAct ? 3 : 2, borderColor, 1);
+      chip.drawRoundedRect(-72, -28, 144, 56, 10);
       chip.endFill();
       chip.x = cx;
       chip.y = cy;
 
       const nick = new Text(
-        s.nickname + (s.seat === yourSeat ? '（你）' : ''),
+        s.nickname + (s.seat === yourSeat ? '（你）' : '') + (isButton ? ' Ⓓ' : ''),
         new TextStyle({ fill: '#ffffff', fontSize: 13, fontWeight: '600' }),
       );
       nick.anchor.set(0.5, 0);
       nick.x = cx;
-      nick.y = cy - 20;
+      nick.y = cy - 22;
 
       const stack = new Text(
-        `筹码 ${s.stack}`,
-        new TextStyle({ fill: '#a8b5e0', fontSize: 12 }),
+        s.folded ? '已弃牌' : `筹码 ${s.stack}${s.all_in ? ' · All-in' : ''}`,
+        new TextStyle({ fill: s.folded ? '#666' : '#a8b5e0', fontSize: 12 }),
       );
       stack.anchor.set(0.5, 0);
       stack.x = cx;
-      stack.y = cy + 2;
+      stack.y = cy + 0;
 
       this.seatLayer.addChild(chip, nick, stack);
+
+      // Bet display in front of seat (toward pot).
+      if (s.bet > 0) {
+        const bet = new Text(
+          `▶ ${s.bet}`,
+          new TextStyle({ fill: '#ffe082', fontSize: 12, fontWeight: '700' }),
+        );
+        bet.anchor.set(0.5, 0);
+        bet.x = cx;
+        bet.y = cy + 28;
+        this.seatLayer.addChild(bet);
+      }
     }
   }
 
@@ -116,6 +144,7 @@ export class TableScene {
 
   renderCommunity(cards: string[]): void {
     this.communityLayer.removeChildren();
+    if (cards.length === 0) return;
     const w = this.app.renderer.width;
     const h = this.app.renderer.height;
     const cx = w * 0.5;
@@ -129,9 +158,61 @@ export class TableScene {
     });
   }
 
+  renderShowdown(showdown: { winners: WinnerInfo[]; reveals: Record<number, string[]> } | null): void {
+    this.revealLayer.removeChildren();
+    if (!showdown) return;
+
+    const w = this.app.renderer.width;
+    const h = this.app.renderer.height;
+
+    // Draw revealed cards next to each non-folded seat.
+    for (const seatStr of Object.keys(showdown.reveals)) {
+      const seat = Number(seatStr);
+      if (seat === this.yourSeat) continue; // already shown via hole layer
+      const cards = showdown.reveals[seat];
+      const slot = TableScene.rotateSeat(seat, this.yourSeat);
+      const pos = SEAT_POSITIONS[slot];
+      const cx = w * pos.xRatio;
+      const cy = h * pos.yRatio - 60;
+      cards.forEach((c, i) => {
+        const card = TableScene.buildCard(c);
+        card.scale.set(0.7);
+        card.x = cx + (i - (cards.length - 1) / 2) * 38;
+        card.y = cy;
+        this.revealLayer.addChild(card);
+      });
+    }
+
+    // Highlight winners.
+    for (const w of showdown.winners) {
+      const slot = TableScene.rotateSeat(w.seat, this.yourSeat);
+      const pos = SEAT_POSITIONS[slot];
+      const cw = this.app.renderer.width;
+      const ch = this.app.renderer.height;
+      const cx = cw * pos.xRatio;
+      const cy = ch * pos.yRatio;
+      const halo = new Graphics();
+      halo.lineStyle(3, 0xffd54f, 1);
+      halo.drawRoundedRect(-78, -34, 156, 68, 12);
+      halo.x = cx;
+      halo.y = cy;
+      this.revealLayer.addChild(halo);
+
+      const winLabel = new Text(
+        `+${w.amount}${w.hand_rank ? ' ' + w.hand_rank : ''}`,
+        new TextStyle({ fill: '#ffd54f', fontSize: 13, fontWeight: '700' }),
+      );
+      winLabel.anchor.set(0.5, 0);
+      winLabel.x = cx;
+      winLabel.y = cy + 38;
+      this.revealLayer.addChild(winLabel);
+    }
+  }
+
   clearHand(): void {
     this.renderCommunity([]);
     this.renderHoleCards([]);
+    this.revealLayer.removeChildren();
   }
 
   private drawFelt(felt: Graphics): void {
@@ -146,7 +227,6 @@ export class TableScene {
 
   private static rotateSeat(seatIndex: number, yourSeat: number): number {
     if (yourSeat < 0) return seatIndex;
-    // Position 0 is your bottom-center seat; rotate so your seat maps to 0.
     return (seatIndex - yourSeat + 6) % 6;
   }
 
