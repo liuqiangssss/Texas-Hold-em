@@ -145,7 +145,7 @@ func evaluate(cards []card) Result {
 	n := len(cards)
 	bestScore := Score(0)
 	var bestHand [5]card
-	tmp := make([]card, 5)
+	var tmp [5]card
 	idx := []int{0, 1, 2, 3, 4}
 	for {
 		for i := 0; i < 5; i++ {
@@ -154,7 +154,7 @@ func evaluate(cards []card) Result {
 		sc, _ := score5(tmp)
 		if sc > bestScore {
 			bestScore = sc
-			copy(bestHand[:], tmp)
+			bestHand = tmp
 		}
 		// next combination (lex order)
 		i := 4
