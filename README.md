@@ -21,11 +21,17 @@ Texas-Hold-em/
 ```bash
 docker compose up --build       # 首次或代码变更后重新构建并启动
 docker compose up -d            # 后续直接后台启动（已构建过）
-docker compose down             # 停止并清理容器
+docker compose down             # 停止并清理容器（保留数据卷）
+docker compose down -v          # 停止并清理容器 + 删除 mongo 数据
 ```
 
 启动后访问 [http://localhost:8080](http://localhost:8080)。
 nginx 会把 `/ws` 反代到内网的 server 容器，浏览器只暴露一个端口，不需要单独配 CORS。
+
+服务编排：
+- `mongo`：MongoDB 7，仅在 docker 内网暴露 `27017`，数据落 `mongo_data` 卷持久化。手历落库（S3.9）将通过 `MONGO_URI=mongodb://mongo:27017` / `MONGO_DB=texas` 写入。
+- `server`：Go 网关，依赖 `mongo` healthy 后启动。
+- `web`：nginx + React 静态资源，反代 `/ws` 到 server。
 
 ### 方式二：本地分别运行（开发）
 
