@@ -19,6 +19,16 @@ type seatState struct {
 	allIn      bool
 	hasActed   bool   // acted at least once in this round (post-blinds)
 	sittingOut bool
+
+	pending *pendingAction // armed pre-action; consumed when turn lands
+}
+
+// pendingAction is a player's pre-armed intent. It is auto-resolved into a
+// concrete action when the seat becomes toAct. amount is interpreted by the
+// resolver: ActPreRaiseTo carries the target bet level; the others ignore it.
+type pendingAction struct {
+	action proto.ActionType
+	amount int
 }
 
 // hand is the per-hand mutable state owned by the table actor. All mutations
@@ -515,6 +525,86 @@ func (h *hand) settle() ([]eval.Pot, []proto.WinnerInfo, map[int][]string) {
 	}
 	h.stage = proto.StageShowdown
 	return pots, winners, reveals
+}
+
+// ---------- pre-actions ----------
+
+// setPending stores a pre-action for a seat after sanity-checking the
+// arguments. Returns an error if the request is malformed; out-of-context
+// (e.g. the seat is currently to-act, or the hand has no betting) is *not* an
+// error — it is treated as a request that simply fires immediately.
+func (h *hand) setPending(seat int, action proto.ActionType, amount int) error {
+	s := h.seats[seat]
+	if s == nil || s.folded || s.allIn {
+		return errors.New("seat not active in this hand")
+	}
+	switch action {
+	case proto.ActPreClear:
+		s.pending = nil
+		return nil
+	case proto.ActPreCheckFold, proto.ActPreCallAny:
+		s.pending = &pendingAction{action: action}
+		return nil
+	case proto.ActPreRaiseTo:
+		if amount <= 0 {
+			return fmt.Errorf("%w: pre_raise_to needs positive amount", errBadAmount)
+		}
+		s.pending = &pendingAction{action: action, amount: amount}
+		return nil
+	default:
+		return fmt.Errorf("not a pre-action: %s", action)
+	}
+}
+
+// resolvePending interprets a seat's pending pre-action against the current
+// hand state, returning the concrete (action, amount) to apply via
+// applyAction, or ok=false when the pre-action no longer fits and should be
+// discarded silently.
+func (h *hand) resolvePending(seat int) (proto.ActionType, int, bool) {
+	s := h.seats[seat]
+	if s == nil || s.pending == nil {
+		return "", 0, false
+	}
+	p := s.pending
+	switch p.action {
+	case proto.ActPreCheckFold:
+		if h.currentBet > s.bet {
+			return proto.ActFold, 0, true
+		}
+		return proto.ActCheck, 0, true
+	case proto.ActPreCallAny:
+		if h.currentBet > s.bet {
+			return proto.ActCall, 0, true
+		}
+		return proto.ActCheck, 0, true
+	case proto.ActPreRaiseTo:
+		// Discard if the table has already moved past the planned level, or
+		// if the player can no longer make a legal raise (would be a partial
+		// all-in below currentBet, etc).
+		if p.amount <= h.currentBet {
+			return "", 0, false
+		}
+		need := p.amount - s.bet
+		if need <= 0 || need > s.stack {
+			return "", 0, false
+		}
+		raiseInc := p.amount - h.currentBet
+		shortAllIn := need == s.stack && raiseInc < h.minRaise
+		if !shortAllIn && raiseInc < h.minRaise {
+			return "", 0, false
+		}
+		return proto.ActRaise, p.amount, true
+	}
+	return "", 0, false
+}
+
+// clearPending removes any armed pre-action for the seat. Used after
+// resolvePending returned a result we just applied, or when state has
+// invalidated the pre-action.
+func (h *hand) clearPending(seat int) {
+	if s := h.seats[seat]; s != nil {
+		s.pending = nil
+	}
 }
 
 // awardSinglePot is used when only one player is left (everyone else folded).

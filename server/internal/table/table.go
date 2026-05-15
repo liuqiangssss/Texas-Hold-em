@@ -15,10 +15,16 @@ import (
 const MaxSeats = 6
 
 const (
-	autoStartDelay   = 800 * time.Millisecond
-	streetDelay      = 900 * time.Millisecond
-	handEndDelay     = 2500 * time.Millisecond
-	defaultBuyIn     = 1000
+	autoStartDelay = 800 * time.Millisecond
+	streetDelay    = 900 * time.Millisecond
+	handEndDelay   = 2500 * time.Millisecond
+	defaultBuyIn   = 1000
+
+	// S3.6 Time Bank.
+	baseTurnMs        = 15_000
+	timeBankInitMs    = 30_000
+	timeBankPerHandMs = 5_000
+	timeBankCapMs     = 60_000
 )
 
 // Player is the server-side view of a seated client.
@@ -28,6 +34,11 @@ type Player struct {
 	Seat     int
 	Stack    int
 	Send     chan<- any // per-client outbound channel (JSON encoded upstream)
+
+	// TimeBankMs is the player's personal time-bank reserve, persisted across
+	// hands at the same table. Replenished by timeBankPerHandMs at the end of
+	// every hand they survive (capped at timeBankCapMs).
+	TimeBankMs int
 }
 
 // ---- actor commands ----
@@ -58,6 +69,21 @@ type actionCmd struct {
 	amount int
 }
 
+type preActionCmd struct {
+	userID string
+	handID string
+	action proto.ActionType
+	amount int
+}
+
+// turnTimeoutCmd is fired by an internal timer when a seat has run through
+// both base time and their personal time bank. handID + seat guard against
+// stale fires from old turns.
+type turnTimeoutCmd struct {
+	handID string
+	seat   int
+}
+
 // Table is a single 6-max poker table running in its own goroutine (actor).
 type Table struct {
 	ID     string
@@ -70,6 +96,13 @@ type Table struct {
 	seatedCount atomic.Int32
 
 	cmdIn chan any
+
+	// Turn timer state — only mutated from the actor goroutine.
+	turnTimer    *time.Timer
+	turnHandID   string
+	turnSeat     int
+	turnStartAt  time.Time
+	turnBudgetMs int // base + bank used to size the timer
 }
 
 func New(blinds [2]int) *Table {
@@ -115,7 +148,9 @@ func (t *Table) handle(cmd any) {
 				if t.hand != nil && t.hand.seats[i] != nil && !t.hand.seats[i].folded {
 					t.hand.seats[i].folded = true
 					t.hand.seats[i].hasActed = true
+					t.hand.clearPending(i)
 					if t.hand.toAct == i {
+						t.cancelTurnTimer()
 						t.hand.advance()
 					}
 					t.maybeFinishStreetOrHand()
@@ -141,6 +176,10 @@ func (t *Table) handle(cmd any) {
 		}
 	case actionCmd:
 		t.handleAction(c)
+	case preActionCmd:
+		t.handlePreAction(c)
+	case turnTimeoutCmd:
+		t.handleTurnTimeout(c)
 	default:
 		if t.handleExtra(cmd) {
 			return
@@ -177,6 +216,12 @@ func (t *Table) Action(userID, handID string, action proto.ActionType, amount in
 	t.cmdIn <- actionCmd{userID: userID, handID: handID, action: action, amount: amount}
 }
 
+// PreAction enqueues a pre-armed action (or a clear). Returns immediately;
+// the slot is updated server-side and resolved when the seat's turn lands.
+func (t *Table) PreAction(userID, handID string, action proto.ActionType, amount int) {
+	t.cmdIn <- preActionCmd{userID: userID, handID: handID, action: action, amount: amount}
+}
+
 // ---- seating ----
 
 func (t *Table) seatPlayer(p *Player) bool {
@@ -186,9 +231,13 @@ func (t *Table) seatPlayer(p *Player) bool {
 			if p.Stack <= 0 {
 				p.Stack = defaultBuyIn
 			}
+			if p.TimeBankMs <= 0 {
+				p.TimeBankMs = timeBankInitMs
+			}
 			t.seats[i] = p
 			t.seatedCount.Add(1)
-			log.Printf("[table %s] %s seated at %d (stack %d)", t.ID[:8], p.Nickname, i, p.Stack)
+			log.Printf("[table %s] %s seated at %d (stack %d, bank %dms)",
+				t.ID[:8], p.Nickname, i, p.Stack, p.TimeBankMs)
 			return true
 		}
 	}
@@ -350,6 +399,7 @@ func (t *Table) cleanupHand() {
 	if t.hand == nil {
 		return
 	}
+	t.cancelTurnTimer()
 	// Sync each player's persistent stack from per-hand stack and clear
 	// hand state.
 	for i, s := range t.hand.seats {
@@ -358,6 +408,18 @@ func (t *Table) cleanupHand() {
 		}
 	}
 	t.hand = nil
+	// Replenish time bank for everyone still seated. The cap protects
+	// against unboundedly accumulating bank for players who fold instantly
+	// every hand.
+	for _, p := range t.seats {
+		if p == nil {
+			continue
+		}
+		p.TimeBankMs += timeBankPerHandMs
+		if p.TimeBankMs > timeBankCapMs {
+			p.TimeBankMs = timeBankCapMs
+		}
+	}
 	// Drop players with 0 chips after the hand.
 	for i, p := range t.seats {
 		if p != nil && p.Stack <= 0 {
@@ -394,11 +456,29 @@ func (t *Table) handleAction(c actionCmd) {
 		t.sendErrorByUser(c.userID, "not_seated", "player not at table")
 		return
 	}
-	actual, paid, err := t.hand.applyAction(seat, c.action, c.amount)
-	if err != nil {
-		t.sendErrorByUser(c.userID, "illegal_action", err.Error())
-		return
+	// A real action arrived in time — settle the bank and apply.
+	if seat == t.hand.toAct {
+		t.consumeBankFor(seat, time.Since(t.turnStartAt))
 	}
+	t.applyActionAndBroadcast(seat, c.action, c.amount, true /* surfaceErrors */)
+}
+
+// applyActionAndBroadcast is the shared path for human actions, pre-action
+// resolutions, and forced-timeout fallbacks. Returns true if the action was
+// applied (either successfully or surfaced as an error to the player).
+func (t *Table) applyActionAndBroadcast(seat int, action proto.ActionType, amount int, surfaceErrors bool) bool {
+	actual, paid, err := t.hand.applyAction(seat, action, amount)
+	if err != nil {
+		if surfaceErrors {
+			if p := t.seats[seat]; p != nil {
+				t.sendErrorByUser(p.UserID, "illegal_action", err.Error())
+			}
+		}
+		return false
+	}
+	// Action consumed any pre-action this seat had armed.
+	t.hand.clearPending(seat)
+	t.cancelTurnTimer()
 	t.broadcast(proto.ActionApplied{
 		Envelope: proto.Envelope{Type: proto.MsgActionApplied, Seq: t.nextSeq()},
 		HandID:   t.hand.id,
@@ -409,8 +489,66 @@ func (t *Table) handleAction(c actionCmd) {
 		Bet:      t.hand.seats[seat].bet,
 	})
 	t.broadcastPotUpdate()
-
 	t.maybeFinishStreetOrHand()
+	return true
+}
+
+// handlePreAction validates and stores (or clears) a seat's pre-action.
+func (t *Table) handlePreAction(c preActionCmd) {
+	if t.hand == nil {
+		t.sendErrorByUser(c.userID, "no_hand", "no active hand")
+		return
+	}
+	if c.handID != "" && c.handID != t.hand.id {
+		t.sendErrorByUser(c.userID, "stale_hand", "pre-action targets a finished hand")
+		return
+	}
+	seat := -1
+	for i, p := range t.seats {
+		if p != nil && p.UserID == c.userID {
+			seat = i
+			break
+		}
+	}
+	if seat < 0 {
+		t.sendErrorByUser(c.userID, "not_seated", "player not at table")
+		return
+	}
+	if err := t.hand.setPending(seat, c.action, c.amount); err != nil {
+		t.sendErrorByUser(c.userID, "illegal_pre_action", err.Error())
+		return
+	}
+	// If the player armed a pre-action exactly while their turn is current,
+	// fire it immediately.
+	if t.hand.toAct == seat {
+		t.tryResolvePreActionLoop()
+	}
+}
+
+// handleTurnTimeout fires when the actor's whole budget has elapsed without
+// an action. Auto-fold (when facing a bet) or auto-check.
+func (t *Table) handleTurnTimeout(c turnTimeoutCmd) {
+	if t.hand == nil || t.hand.id != c.handID {
+		return
+	}
+	if t.hand.toAct != c.seat {
+		return
+	}
+	s := t.hand.seats[c.seat]
+	if s == nil {
+		return
+	}
+	// Bank is fully consumed when we hit the timeout.
+	if p := t.seats[c.seat]; p != nil {
+		p.TimeBankMs = 0
+	}
+	auto := proto.ActFold
+	if h := t.hand; s.bet >= h.currentBet {
+		auto = proto.ActCheck
+	}
+	log.Printf("[table %s] hand %s seat %d timeout → %s",
+		t.ID[:8], t.hand.id[:8], c.seat, auto)
+	t.applyActionAndBroadcast(c.seat, auto, 0, false)
 }
 
 // maybeFinishStreetOrHand inspects the hand state after an action (or a
@@ -558,6 +696,12 @@ func (t *Table) broadcastToAct() {
 	if t.hand == nil || t.hand.toAct < 0 {
 		return
 	}
+	// First, attempt to chain through any pre-actions that the seats waiting
+	// to-act have armed. If a pre-action fires, it will recurse via
+	// maybeFinishStreetOrHand → broadcastToAct, so we just return.
+	if t.tryResolvePreActionLoop() {
+		return
+	}
 	s := t.hand.seats[t.hand.toAct]
 	if s == nil {
 		return
@@ -566,14 +710,95 @@ func (t *Table) broadcastToAct() {
 	if toCall < 0 {
 		toCall = 0
 	}
+	bank := 0
+	if p := t.seats[t.hand.toAct]; p != nil {
+		bank = p.TimeBankMs
+	}
 	t.broadcast(proto.ToActMsg{
 		Envelope:   proto.Envelope{Type: proto.MsgToAct, Seq: t.nextSeq()},
 		HandID:     t.hand.id,
 		Seat:       t.hand.toAct,
-		TimeLeftMs: 0, // MVP: no time bank yet
+		TimeLeftMs: baseTurnMs,
+		TimeBankMs: bank,
 		MinRaise:   t.hand.minRaise,
 		ToCall:     toCall,
 	})
+	t.armTurnTimer(t.hand.id, t.hand.toAct, baseTurnMs+bank)
+}
+
+// tryResolvePreActionLoop fires at most once for the current toAct seat. If
+// the seat has an armed pre-action that resolves cleanly, it is applied and
+// the resulting state change advances toAct (which the caller chain will
+// re-broadcast). Returns true when a pre-action fired.
+func (t *Table) tryResolvePreActionLoop() bool {
+	if t.hand == nil || t.hand.toAct < 0 {
+		return false
+	}
+	seat := t.hand.toAct
+	action, amount, ok := t.hand.resolvePending(seat)
+	if !ok {
+		// No applicable pre-action — discard any stale slot so it doesn't
+		// linger into a future round with mutated context.
+		t.hand.clearPending(seat)
+		return false
+	}
+	// Apply through the same path as a real action — pre-action does not
+	// consume bank time (the player decided ahead of their turn).
+	return t.applyActionAndBroadcast(seat, action, amount, false)
+}
+
+// armTurnTimer (re)arms the per-turn timer. Stops any previous timer first.
+// Total budget is base + the seat's current time bank (caller computes).
+func (t *Table) armTurnTimer(handID string, seat int, totalMs int) {
+	t.cancelTurnTimer()
+	if totalMs <= 0 {
+		// Defensive: a player with 0 base time would never get to act, so
+		// fall back to base.
+		totalMs = baseTurnMs
+	}
+	t.turnHandID = handID
+	t.turnSeat = seat
+	t.turnStartAt = time.Now()
+	t.turnBudgetMs = totalMs
+	t.turnTimer = time.AfterFunc(time.Duration(totalMs)*time.Millisecond, func() {
+		select {
+		case t.cmdIn <- turnTimeoutCmd{handID: handID, seat: seat}:
+		default:
+			log.Printf("[table %s] dropped timeout cmd hand=%s seat=%d", t.ID[:8], handID[:8], seat)
+		}
+	})
+}
+
+func (t *Table) cancelTurnTimer() {
+	if t.turnTimer != nil {
+		t.turnTimer.Stop()
+		t.turnTimer = nil
+	}
+	t.turnHandID = ""
+	t.turnSeat = -1
+	t.turnStartAt = time.Time{}
+	t.turnBudgetMs = 0
+}
+
+// consumeBankFor deducts the portion of `elapsed` past base time from the
+// player's time bank. Floors at 0. No-op unless the active timer is the one
+// for `seat` in the current hand.
+func (t *Table) consumeBankFor(seat int, elapsed time.Duration) {
+	if t.hand == nil || t.turnHandID != t.hand.id || t.turnSeat != seat {
+		return
+	}
+	p := t.seats[seat]
+	if p == nil {
+		return
+	}
+	used := int(elapsed/time.Millisecond) - baseTurnMs
+	if used <= 0 {
+		return
+	}
+	p.TimeBankMs -= used
+	if p.TimeBankMs < 0 {
+		p.TimeBankMs = 0
+	}
 }
 
 func (t *Table) sendErrorByUser(userID, code, msg string) {
