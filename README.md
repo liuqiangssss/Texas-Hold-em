@@ -16,14 +16,27 @@ Texas-Hold-em/
 
 ## 快速开始
 
-### 后端
+### 方式一：Docker Compose 一键启动（推荐）
+
+```bash
+docker compose up --build       # 首次或代码变更后重新构建并启动
+docker compose up -d            # 后续直接后台启动（已构建过）
+docker compose down             # 停止并清理容器
+```
+
+启动后访问 [http://localhost:8080](http://localhost:8080)。
+nginx 会把 `/ws` 反代到内网的 server 容器，浏览器只暴露一个端口，不需要单独配 CORS。
+
+### 方式二：本地分别运行（开发）
+
+后端：
 ```bash
 cd server
 go run ./cmd/server
 # listening on :8080
 ```
 
-### 前端
+前端：
 ```bash
 cd web
 npm install

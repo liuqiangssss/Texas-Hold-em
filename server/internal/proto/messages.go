@@ -6,6 +6,9 @@ const (
 	MsgLogin         MsgType = "login"
 	MsgLoginOK       MsgType = "login_ok"
 	MsgSit           MsgType = "sit"
+	MsgSitOut        MsgType = "sit_out"
+	MsgSitIn         MsgType = "sit_in"
+	MsgLeave         MsgType = "leave"
 	MsgAction        MsgType = "action"
 	MsgPreAction     MsgType = "pre_action"
 	MsgTableState    MsgType = "table_state"
@@ -74,6 +77,22 @@ type SitReq struct {
 	Blinds  [2]int `json:"blinds"`
 }
 
+// SitOutReq — request to sit out starting next hand.
+type SitOutReq struct {
+	Envelope
+}
+
+// SitInReq — request to come back from sit-out. Server may force the player
+// to post a dead BB on the next hand if they missed BB while sitting out.
+type SitInReq struct {
+	Envelope
+}
+
+// LeaveReq — request to leave the table. Stack returns to the client account.
+type LeaveReq struct {
+	Envelope
+}
+
 // ActionReq — client intent for the current acting seat.
 type ActionReq struct {
 	Envelope
@@ -93,15 +112,17 @@ type PreActionReq struct {
 }
 
 type SeatInfo struct {
-	Seat      int    `json:"seat"`
-	UserID    string `json:"user_id"`
-	Nickname  string `json:"nickname"`
-	Stack     int    `json:"stack"`
-	Bet       int    `json:"bet"`
-	Committed int    `json:"committed"`
-	Folded    bool   `json:"folded"`
-	AllIn     bool   `json:"all_in"`
-	SittingOut bool  `json:"sitting_out"`
+	Seat        int  `json:"seat"`
+	UserID      string `json:"user_id"`
+	Nickname    string `json:"nickname"`
+	Stack       int  `json:"stack"`
+	Bet         int  `json:"bet"`
+	Committed   int  `json:"committed"`
+	Folded      bool `json:"folded"`
+	AllIn       bool `json:"all_in"`
+	SittingOut  bool `json:"sitting_out"`
+	MustPostBB  bool `json:"must_post_bb"`
+	MissedHands int  `json:"missed_hands,omitempty"`
 }
 
 type TableState struct {

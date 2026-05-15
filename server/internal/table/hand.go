@@ -154,11 +154,22 @@ func (h *hand) drawCard() string {
 // startPreflop posts blinds, deals hole cards, and computes the first to-act
 // seat (UTG = first seat after the BB). Returns the per-seat hole cards keyed
 // by seat id so the actor can deliver them privately.
-func (h *hand) startPreflop() map[int][]string {
+//
+// deadBlindSeats lists seats that owe a "dead BB to enter" this hand (typical
+// when the player just sat in mid-orbit and missed their natural BB). Each
+// such seat contributes BB worth of chips into the pot but does NOT raise
+// currentBet/minRaise — the player still owes the call when their turn lands.
+// A seat that is also the natural BB this hand is skipped from the dead-blind
+// list (no double-post). If `deadBlindSeats` is nil/empty, behaves identically
+// to the pre-S3.8 path.
+func (h *hand) startPreflop(deadBlindSeats ...int) map[int][]string {
 	sb, bb := h.blinds[0], h.blinds[1]
 
 	// Heads-up: button is SB, the other seat is BB.
 	// 3+ handed: button + 1 = SB, button + 2 = BB.
+	// Sitting-out seats are filtered out at table-level (their seatState is
+	// nil here), so nextSeatedAfter naturally skips them — this gives us
+	// dead-small-blind behavior when the SB seat is empty.
 	live := h.liveSeats()
 	var sbSeat, bbSeat int
 	if len(live) == 2 {
@@ -168,6 +179,16 @@ func (h *hand) startPreflop() map[int][]string {
 		sbSeat = h.nextSeatedAfter(h.button)
 		bbSeat = h.nextSeatedAfter(sbSeat)
 	}
+
+	// Dead blinds first — money goes into the pot before regular blinds so
+	// the order of operations doesn't matter for currentBet/minRaise.
+	for _, ds := range deadBlindSeats {
+		if ds == bbSeat {
+			continue // they will post the natural BB instead
+		}
+		h.postDeadBlind(ds, bb)
+	}
+
 	h.postBlind(sbSeat, sb)
 	h.postBlind(bbSeat, bb)
 
@@ -215,6 +236,25 @@ func (h *hand) postBlind(seat, amount int) {
 	}
 	s.stack -= pay
 	s.bet += pay
+	s.committed += pay
+}
+
+// postDeadBlind drops `amount` chips into the pot from `seat` without touching
+// the seat's per-round bet. The chips count toward `committed` (drives side-
+// pot eligibility) but do NOT shift currentBet/minRaise — the player still
+// owes a full call to see the flop. If the seat doesn't have enough chips,
+// they go all-in for the dead blind.
+func (h *hand) postDeadBlind(seat, amount int) {
+	s := h.seats[seat]
+	if s == nil {
+		return
+	}
+	pay := amount
+	if pay > s.stack {
+		pay = s.stack
+		s.allIn = true
+	}
+	s.stack -= pay
 	s.committed += pay
 }
 

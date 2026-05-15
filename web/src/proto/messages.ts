@@ -4,7 +4,11 @@ export type MsgType =
   | 'login'
   | 'login_ok'
   | 'sit'
+  | 'sit_out'
+  | 'sit_in'
+  | 'leave'
   | 'action'
+  | 'pre_action'
   | 'table_state'
   | 'hand_start'
   | 'hand_end'
@@ -23,7 +27,11 @@ export type ActionType =
   | 'bet'
   | 'raise'
   | 'all_in'
-  | 'post_blind';
+  | 'post_blind'
+  | 'pre_check_fold'
+  | 'pre_call_any'
+  | 'pre_raise_to'
+  | 'pre_clear';
 
 export type Stage =
   | 'waiting'
@@ -55,8 +63,27 @@ export interface SitReq extends Envelope {
   blinds: [number, number];
 }
 
+export interface SitOutReq extends Envelope {
+  type: 'sit_out';
+}
+
+export interface SitInReq extends Envelope {
+  type: 'sit_in';
+}
+
+export interface LeaveReq extends Envelope {
+  type: 'leave';
+}
+
 export interface ActionReq extends Envelope {
   type: 'action';
+  hand_id: string;
+  action: ActionType;
+  amount?: number;
+}
+
+export interface PreActionReq extends Envelope {
+  type: 'pre_action';
   hand_id: string;
   action: ActionType;
   amount?: number;
@@ -72,6 +99,8 @@ export interface SeatInfo {
   folded: boolean;
   all_in: boolean;
   sitting_out: boolean;
+  must_post_bb: boolean;
+  missed_hands?: number;
 }
 
 export interface TableState extends Envelope {
@@ -128,6 +157,7 @@ export interface ToActMsg extends Envelope {
   hand_id: string;
   seat: number;
   time_left_ms: number;
+  time_bank_ms: number;
   min_raise: number;
   to_call: number;
 }
@@ -184,4 +214,11 @@ export type ServerMsg =
   | PotUpdate
   | ShowdownMsg
   | ErrorMsg;
-export type ClientMsg = LoginReq | SitReq | ActionReq;
+export type ClientMsg =
+  | LoginReq
+  | SitReq
+  | SitOutReq
+  | SitInReq
+  | LeaveReq
+  | ActionReq
+  | PreActionReq;
