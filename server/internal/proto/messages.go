@@ -6,7 +6,11 @@ const (
 	MsgLogin         MsgType = "login"
 	MsgLoginOK       MsgType = "login_ok"
 	MsgSit           MsgType = "sit"
+	MsgSitOut        MsgType = "sit_out"
+	MsgSitIn         MsgType = "sit_in"
+	MsgLeave         MsgType = "leave"
 	MsgAction        MsgType = "action"
+	MsgPreAction     MsgType = "pre_action"
 	MsgTableState    MsgType = "table_state"
 	MsgHandStart     MsgType = "hand_start"
 	MsgHandEnd       MsgType = "hand_end"
@@ -30,6 +34,13 @@ const (
 	ActRaise     ActionType = "raise"
 	ActAllIn     ActionType = "all_in"
 	ActPostBlind ActionType = "post_blind"
+
+	// PreActX — client pre-action intents. Only valid via MsgPreAction; stored
+	// per seat and consumed when it becomes that seat's turn.
+	ActPreCheckFold ActionType = "pre_check_fold"
+	ActPreCallAny   ActionType = "pre_call_any"
+	ActPreRaiseTo   ActionType = "pre_raise_to"
+	ActPreClear     ActionType = "pre_clear"
 )
 
 // Stage — phases of a single hand.
@@ -66,6 +77,22 @@ type SitReq struct {
 	Blinds  [2]int `json:"blinds"`
 }
 
+// SitOutReq — request to sit out starting next hand.
+type SitOutReq struct {
+	Envelope
+}
+
+// SitInReq — request to come back from sit-out. Server may force the player
+// to post a dead BB on the next hand if they missed BB while sitting out.
+type SitInReq struct {
+	Envelope
+}
+
+// LeaveReq — request to leave the table. Stack returns to the client account.
+type LeaveReq struct {
+	Envelope
+}
+
 // ActionReq — client intent for the current acting seat.
 type ActionReq struct {
 	Envelope
@@ -74,16 +101,28 @@ type ActionReq struct {
 	Amount int        `json:"amount,omitempty"`
 }
 
+// PreActionReq — client intent to arm or clear a pre-action. Action must be
+// one of the ActPre* constants. Server validates and stores; the eventual
+// concrete action is broadcast as ActionApplied when this seat's turn lands.
+type PreActionReq struct {
+	Envelope
+	HandID string     `json:"hand_id"`
+	Action ActionType `json:"action"`
+	Amount int        `json:"amount,omitempty"`
+}
+
 type SeatInfo struct {
-	Seat      int    `json:"seat"`
-	UserID    string `json:"user_id"`
-	Nickname  string `json:"nickname"`
-	Stack     int    `json:"stack"`
-	Bet       int    `json:"bet"`
-	Committed int    `json:"committed"`
-	Folded    bool   `json:"folded"`
-	AllIn     bool   `json:"all_in"`
-	SittingOut bool  `json:"sitting_out"`
+	Seat        int  `json:"seat"`
+	UserID      string `json:"user_id"`
+	Nickname    string `json:"nickname"`
+	Stack       int  `json:"stack"`
+	Bet         int  `json:"bet"`
+	Committed   int  `json:"committed"`
+	Folded      bool `json:"folded"`
+	AllIn       bool `json:"all_in"`
+	SittingOut  bool `json:"sitting_out"`
+	MustPostBB  bool `json:"must_post_bb"`
+	MissedHands int  `json:"missed_hands,omitempty"`
 }
 
 type TableState struct {
@@ -137,11 +176,14 @@ type ActionApplied struct {
 }
 
 // ToAct tells everyone whose turn it is and how much time is left.
+// TimeLeftMs is the base turn budget; TimeBankMs is the personal time bank
+// the player can additionally consume. Total deadline = TimeLeftMs + TimeBankMs.
 type ToActMsg struct {
 	Envelope
 	HandID     string `json:"hand_id"`
 	Seat       int    `json:"seat"`
 	TimeLeftMs int    `json:"time_left_ms"`
+	TimeBankMs int    `json:"time_bank_ms"`
 	MinRaise   int    `json:"min_raise"`
 	ToCall     int    `json:"to_call"`
 }

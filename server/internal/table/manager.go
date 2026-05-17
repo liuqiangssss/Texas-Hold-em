@@ -3,6 +3,8 @@ package table
 import (
 	"context"
 	"sync"
+
+	"github.com/liuqiangssss/texas-holdem/server/internal/store"
 )
 
 // Manager maintains the live set of tables and basic matchmaking.
@@ -11,12 +13,20 @@ type Manager struct {
 	mu     sync.Mutex
 	ctx    context.Context
 	tables map[string]*Table
+	store  store.HandHistoryStore
 }
 
-func NewManager(ctx context.Context) *Manager {
+// NewManager builds the table manager. `s` receives a HandRecord at the end
+// of every hand; pass store.NewNoopStore() (or nil, which auto-falls back)
+// when no persistence is configured.
+func NewManager(ctx context.Context, s store.HandHistoryStore) *Manager {
+	if s == nil {
+		s = store.NewNoopStore()
+	}
 	return &Manager{
 		ctx:    ctx,
 		tables: make(map[string]*Table),
+		store:  s,
 	}
 }
 
@@ -31,6 +41,7 @@ func (m *Manager) FindOrCreate(blinds [2]int) *Table {
 		}
 	}
 	t := New(blinds)
+	t.store = m.store
 	m.tables[t.ID] = t
 	go t.Run(m.ctx)
 	return t

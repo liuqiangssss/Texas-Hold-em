@@ -154,6 +154,40 @@ func (s *clientSession) reader(ctx context.Context) error {
 			}
 			s.table.Action(s.userID, req.HandID, req.Action, req.Amount)
 
+		case proto.MsgPreAction:
+			if s.table == nil {
+				s.sendError("not_at_table", "sit at a table first")
+				continue
+			}
+			var req proto.PreActionReq
+			if err := json.Unmarshal(data, &req); err != nil {
+				s.sendError("bad_frame", "pre_action payload invalid")
+				continue
+			}
+			s.table.PreAction(s.userID, req.HandID, req.Action, req.Amount)
+
+		case proto.MsgSitOut:
+			if s.table == nil {
+				s.sendError("not_at_table", "sit at a table first")
+				continue
+			}
+			s.table.SitOut(s.userID)
+
+		case proto.MsgSitIn:
+			if s.table == nil {
+				s.sendError("not_at_table", "sit at a table first")
+				continue
+			}
+			s.table.SitIn(s.userID)
+
+		case proto.MsgLeave:
+			if s.table == nil {
+				s.sendError("not_at_table", "sit at a table first")
+				continue
+			}
+			s.table.Leave(s.userID)
+			s.table = nil
+
 		default:
 			s.sendError("unknown_type", string(env.Type))
 		}

@@ -3,15 +3,20 @@ package table
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/liuqiangssss/texas-holdem/server/internal/eval"
 	"github.com/liuqiangssss/texas-holdem/server/internal/proto"
+	"github.com/liuqiangssss/texas-holdem/server/internal/store"
 )
 
 // seatState tracks per-seat info that lives only for the duration of a hand.
 type seatState struct {
 	seat       int
 	stack      int    // chips remaining
+	stackIn    int    // chips at hand start (before any blinds posted) — for record
+	userID     string // immutable for the lifetime of the hand
+	nickname   string
 	holeCards  []string
 	bet        int    // chips invested in the current betting round
 	committed  int    // total invested across the whole hand (drives side pots)
@@ -19,6 +24,16 @@ type seatState struct {
 	allIn      bool
 	hasActed   bool   // acted at least once in this round (post-blinds)
 	sittingOut bool
+
+	pending *pendingAction // armed pre-action; consumed when turn lands
+}
+
+// pendingAction is a player's pre-armed intent. It is auto-resolved into a
+// concrete action when the seat becomes toAct. amount is interpreted by the
+// resolver: ActPreRaiseTo carries the target bet level; the others ignore it.
+type pendingAction struct {
+	action proto.ActionType
+	amount int
 }
 
 // hand is the per-hand mutable state owned by the table actor. All mutations
@@ -40,14 +55,21 @@ type hand struct {
 
 	button int
 	blinds [2]int
+
+	// record accumulates a structured snapshot of the hand for offline
+	// persistence. Populated by hand methods as the hand progresses;
+	// the Table actor finalizes and ships it to the store at hand end.
+	record *store.HandRecord
 }
 
 // ---------- creation ----------
 
 // newHand initializes a fresh hand from the given seated players. `players`
 // is a snapshot of currently seated, non-sitting-out clients (already with
-// chips); ordering is by seat id ascending.
-func newHand(id string, button int, blinds [2]int, deck []string,
+// chips); ordering is by seat id ascending. tableID is recorded into the
+// HandRecord so the persisted document can be cross-referenced back to its
+// originating table; pass "" if no recording context is available.
+func newHand(id, tableID string, button int, blinds [2]int, deck []string,
 	seats [MaxSeats]*Player) (*hand, error) {
 
 	h := &hand{
@@ -61,16 +83,38 @@ func newHand(id string, button int, blinds [2]int, deck []string,
 		toAct:     -1,
 	}
 	active := 0
+	rec := &store.HandRecord{
+		HandID:    id,
+		TableID:   tableID,
+		Blinds:    blinds,
+		Button:    button,
+		StartedAt: time.Now().UTC(),
+		Seats:     make([]store.SeatSnap, 0, MaxSeats),
+	}
 	for i, p := range seats {
 		if p == nil || p.Stack <= 0 {
 			continue
 		}
-		h.seats[i] = &seatState{seat: i, stack: p.Stack}
+		h.seats[i] = &seatState{
+			seat:     i,
+			stack:    p.Stack,
+			stackIn:  p.Stack,
+			userID:   p.UserID,
+			nickname: p.Nickname,
+		}
+		rec.Seats = append(rec.Seats, store.SeatSnap{
+			Seat:     i,
+			UserID:   p.UserID,
+			Nickname: p.Nickname,
+			StackIn:  p.Stack,
+			IsButton: i == button,
+		})
 		active++
 	}
 	if active < 2 {
 		return nil, errors.New("not enough players")
 	}
+	h.record = rec
 	return h, nil
 }
 
@@ -144,11 +188,22 @@ func (h *hand) drawCard() string {
 // startPreflop posts blinds, deals hole cards, and computes the first to-act
 // seat (UTG = first seat after the BB). Returns the per-seat hole cards keyed
 // by seat id so the actor can deliver them privately.
-func (h *hand) startPreflop() map[int][]string {
+//
+// deadBlindSeats lists seats that owe a "dead BB to enter" this hand (typical
+// when the player just sat in mid-orbit and missed their natural BB). Each
+// such seat contributes BB worth of chips into the pot but does NOT raise
+// currentBet/minRaise — the player still owes the call when their turn lands.
+// A seat that is also the natural BB this hand is skipped from the dead-blind
+// list (no double-post). If `deadBlindSeats` is nil/empty, behaves identically
+// to the pre-S3.8 path.
+func (h *hand) startPreflop(deadBlindSeats ...int) map[int][]string {
 	sb, bb := h.blinds[0], h.blinds[1]
 
 	// Heads-up: button is SB, the other seat is BB.
 	// 3+ handed: button + 1 = SB, button + 2 = BB.
+	// Sitting-out seats are filtered out at table-level (their seatState is
+	// nil here), so nextSeatedAfter naturally skips them — this gives us
+	// dead-small-blind behavior when the SB seat is empty.
 	live := h.liveSeats()
 	var sbSeat, bbSeat int
 	if len(live) == 2 {
@@ -158,8 +213,25 @@ func (h *hand) startPreflop() map[int][]string {
 		sbSeat = h.nextSeatedAfter(h.button)
 		bbSeat = h.nextSeatedAfter(sbSeat)
 	}
-	h.postBlind(sbSeat, sb)
-	h.postBlind(bbSeat, bb)
+
+	// Dead blinds first — money goes into the pot before regular blinds so
+	// the order of operations doesn't matter for currentBet/minRaise.
+	for _, ds := range deadBlindSeats {
+		if ds == bbSeat {
+			continue // they will post the natural BB instead
+		}
+		paid := h.postDeadBlind(ds, bb)
+		h.recordAction("preflop", ds, "post_blind", paid, nil)
+		h.markSeatFlag(ds, func(s *store.SeatSnap) { s.DeadBB = true })
+	}
+
+	sbPaid := h.postBlind(sbSeat, sb)
+	h.recordAction("preflop", sbSeat, "post_blind", sbPaid, nil)
+	h.markSeatFlag(sbSeat, func(s *store.SeatSnap) { s.PostedSB = true })
+
+	bbPaid := h.postBlind(bbSeat, bb)
+	h.recordAction("preflop", bbSeat, "post_blind", bbPaid, nil)
+	h.markSeatFlag(bbSeat, func(s *store.SeatSnap) { s.PostedBB = true })
 
 	h.currentBet = bb
 	h.minRaise = bb
@@ -193,10 +265,12 @@ func (h *hand) startPreflop() map[int][]string {
 	return holes
 }
 
-func (h *hand) postBlind(seat, amount int) {
+// postBlind charges `amount` (clamped to stack) and returns the actually paid
+// chips so callers can record the transaction.
+func (h *hand) postBlind(seat, amount int) int {
 	s := h.seats[seat]
 	if s == nil {
-		return
+		return 0
 	}
 	pay := amount
 	if pay > s.stack {
@@ -206,6 +280,59 @@ func (h *hand) postBlind(seat, amount int) {
 	s.stack -= pay
 	s.bet += pay
 	s.committed += pay
+	return pay
+}
+
+// postDeadBlind drops `amount` chips into the pot from `seat` without touching
+// the seat's per-round bet. The chips count toward `committed` (drives side-
+// pot eligibility) but do NOT shift currentBet/minRaise — the player still
+// owes a full call to see the flop. If the seat doesn't have enough chips,
+// they go all-in for the dead blind. Returns chips actually paid.
+func (h *hand) postDeadBlind(seat, amount int) int {
+	s := h.seats[seat]
+	if s == nil {
+		return 0
+	}
+	pay := amount
+	if pay > s.stack {
+		pay = s.stack
+		s.allIn = true
+	}
+	s.stack -= pay
+	s.committed += pay
+	return pay
+}
+
+// recordAction appends a single timeline entry to the in-progress hand
+// record. No-op when the hand was constructed without a record (legacy
+// tests calling newHand directly with the old signature can't reach this
+// path because newHand always installs a record now).
+func (h *hand) recordAction(stage string, seat int, action string, amount int, cards []string) {
+	if h.record == nil {
+		return
+	}
+	h.record.Actions = append(h.record.Actions, store.ActionRec{
+		Stage:  stage,
+		Seat:   seat,
+		Action: action,
+		Amount: amount,
+		Cards:  cards,
+	})
+}
+
+// markSeatFlag mutates the SeatSnap entry for the given seat in the record,
+// when present. Used to flip booleans like PostedSB/PostedBB/DeadBB after
+// blinds post.
+func (h *hand) markSeatFlag(seat int, fn func(*store.SeatSnap)) {
+	if h.record == nil {
+		return
+	}
+	for i := range h.record.Seats {
+		if h.record.Seats[i].Seat == seat {
+			fn(&h.record.Seats[i])
+			return
+		}
+	}
 }
 
 // ---------- action processing ----------
@@ -237,6 +364,7 @@ func (h *hand) applyAction(seat int, action proto.ActionType, amount int) (proto
 	case proto.ActFold:
 		s.folded = true
 		s.hasActed = true
+		h.recordAction(string(h.stage), seat, string(proto.ActFold), 0, nil)
 		return proto.ActFold, 0, nil
 
 	case proto.ActCheck:
@@ -244,6 +372,7 @@ func (h *hand) applyAction(seat int, action proto.ActionType, amount int) (proto
 			return "", 0, errIllegalCheck
 		}
 		s.hasActed = true
+		h.recordAction(string(h.stage), seat, string(proto.ActCheck), 0, nil)
 		return proto.ActCheck, 0, nil
 
 	case proto.ActCall:
@@ -264,6 +393,7 @@ func (h *hand) applyAction(seat int, action proto.ActionType, amount int) (proto
 		if s.allIn {
 			actual = proto.ActAllIn
 		}
+		h.recordAction(string(h.stage), seat, string(actual), pay, nil)
 		return actual, pay, nil
 
 	case proto.ActBet:
@@ -297,6 +427,7 @@ func (h *hand) applyAction(seat int, action proto.ActionType, amount int) (proto
 		if s.allIn {
 			actual = proto.ActAllIn
 		}
+		h.recordAction(string(h.stage), seat, string(actual), pay, nil)
 		return actual, pay, nil
 
 	case proto.ActRaise, proto.ActAllIn:
@@ -315,6 +446,7 @@ func (h *hand) applyAction(seat int, action proto.ActionType, amount int) (proto
 			s.committed += pay
 			s.allIn = true
 			s.hasActed = true
+			h.recordAction(string(h.stage), seat, string(proto.ActAllIn), pay, nil)
 			return proto.ActAllIn, pay, nil
 		}
 		if amount <= h.currentBet {
@@ -357,6 +489,7 @@ func (h *hand) applyAction(seat int, action proto.ActionType, amount int) (proto
 		if s.allIn {
 			actual = proto.ActAllIn
 		}
+		h.recordAction(string(h.stage), seat, string(actual), pay, nil)
 		return actual, pay, nil
 
 	default:
@@ -418,16 +551,19 @@ func (h *hand) dealStreet() []string {
 		h.stage = proto.StageFlop
 		cards := []string{h.drawCard(), h.drawCard(), h.drawCard()}
 		h.community = append(h.community, cards...)
+		h.recordAction(string(proto.StageFlop), -1, "deal_flop", 0, append([]string(nil), cards...))
 		return cards
 	case proto.StageFlop:
 		h.stage = proto.StageTurn
 		c := h.drawCard()
 		h.community = append(h.community, c)
+		h.recordAction(string(proto.StageTurn), -1, "deal_turn", 0, []string{c})
 		return []string{c}
 	case proto.StageTurn:
 		h.stage = proto.StageRiver
 		c := h.drawCard()
 		h.community = append(h.community, c)
+		h.recordAction(string(proto.StageRiver), -1, "deal_river", 0, []string{c})
 		return []string{c}
 	}
 	return nil
@@ -514,7 +650,134 @@ func (h *hand) settle() ([]eval.Pot, []proto.WinnerInfo, map[int][]string) {
 		}
 	}
 	h.stage = proto.StageShowdown
+	h.finalizeRecord("showdown", pots, winners, reveals)
 	return pots, winners, reveals
+}
+
+// finalizeRecord stamps the end-of-hand fields onto the in-progress record.
+// reason is "showdown" or "fold_out". Pass nil/empty for fields that don't
+// apply to the path (fold_out leaves pots/reveals empty).
+func (h *hand) finalizeRecord(reason string, pots []eval.Pot, winners []proto.WinnerInfo, reveals map[int][]string) {
+	if h.record == nil {
+		return
+	}
+	h.record.Reason = reason
+	h.record.EndedAt = time.Now().UTC()
+	h.record.Community = append([]string(nil), h.community...)
+
+	for i := range h.record.Seats {
+		seat := h.record.Seats[i].Seat
+		if s := h.seats[seat]; s != nil {
+			h.record.Seats[i].StackOut = s.stack
+		}
+	}
+
+	if len(pots) > 0 {
+		h.record.Pots = make([]store.PotRec, 0, len(pots))
+		for _, p := range pots {
+			h.record.Pots = append(h.record.Pots, store.PotRec{
+				Amount:   p.Amount,
+				Eligible: append([]int(nil), p.Eligible...),
+			})
+		}
+	}
+	if len(winners) > 0 {
+		h.record.Winners = make([]store.WinnerRec, 0, len(winners))
+		for _, w := range winners {
+			h.record.Winners = append(h.record.Winners, store.WinnerRec{
+				Seat:     w.Seat,
+				Amount:   w.Amount,
+				HandRank: w.HandRank,
+				Best5:    append([]string(nil), w.Best5...),
+			})
+		}
+	}
+	if len(reveals) > 0 {
+		h.record.HoleCards = make(map[int][]string, len(reveals))
+		for seat, cards := range reveals {
+			h.record.HoleCards[seat] = append([]string(nil), cards...)
+		}
+	}
+}
+
+// ---------- pre-actions ----------
+
+// setPending stores a pre-action for a seat after sanity-checking the
+// arguments. Returns an error if the request is malformed; out-of-context
+// (e.g. the seat is currently to-act, or the hand has no betting) is *not* an
+// error — it is treated as a request that simply fires immediately.
+func (h *hand) setPending(seat int, action proto.ActionType, amount int) error {
+	s := h.seats[seat]
+	if s == nil || s.folded || s.allIn {
+		return errors.New("seat not active in this hand")
+	}
+	switch action {
+	case proto.ActPreClear:
+		s.pending = nil
+		return nil
+	case proto.ActPreCheckFold, proto.ActPreCallAny:
+		s.pending = &pendingAction{action: action}
+		return nil
+	case proto.ActPreRaiseTo:
+		if amount <= 0 {
+			return fmt.Errorf("%w: pre_raise_to needs positive amount", errBadAmount)
+		}
+		s.pending = &pendingAction{action: action, amount: amount}
+		return nil
+	default:
+		return fmt.Errorf("not a pre-action: %s", action)
+	}
+}
+
+// resolvePending interprets a seat's pending pre-action against the current
+// hand state, returning the concrete (action, amount) to apply via
+// applyAction, or ok=false when the pre-action no longer fits and should be
+// discarded silently.
+func (h *hand) resolvePending(seat int) (proto.ActionType, int, bool) {
+	s := h.seats[seat]
+	if s == nil || s.pending == nil {
+		return "", 0, false
+	}
+	p := s.pending
+	switch p.action {
+	case proto.ActPreCheckFold:
+		if h.currentBet > s.bet {
+			return proto.ActFold, 0, true
+		}
+		return proto.ActCheck, 0, true
+	case proto.ActPreCallAny:
+		if h.currentBet > s.bet {
+			return proto.ActCall, 0, true
+		}
+		return proto.ActCheck, 0, true
+	case proto.ActPreRaiseTo:
+		// Discard if the table has already moved past the planned level, or
+		// if the player can no longer make a legal raise (would be a partial
+		// all-in below currentBet, etc).
+		if p.amount <= h.currentBet {
+			return "", 0, false
+		}
+		need := p.amount - s.bet
+		if need <= 0 || need > s.stack {
+			return "", 0, false
+		}
+		raiseInc := p.amount - h.currentBet
+		shortAllIn := need == s.stack && raiseInc < h.minRaise
+		if !shortAllIn && raiseInc < h.minRaise {
+			return "", 0, false
+		}
+		return proto.ActRaise, p.amount, true
+	}
+	return "", 0, false
+}
+
+// clearPending removes any armed pre-action for the seat. Used after
+// resolvePending returned a result we just applied, or when state has
+// invalidated the pre-action.
+func (h *hand) clearPending(seat int) {
+	if s := h.seats[seat]; s != nil {
+		s.pending = nil
+	}
 }
 
 // awardSinglePot is used when only one player is left (everyone else folded).
@@ -534,5 +797,10 @@ func (h *hand) awardSinglePot() (int, int) {
 	if winnerSeat >= 0 {
 		h.seats[winnerSeat].stack += total
 	}
+	winners := []proto.WinnerInfo{}
+	if winnerSeat >= 0 {
+		winners = append(winners, proto.WinnerInfo{Seat: winnerSeat, Amount: total})
+	}
+	h.finalizeRecord("fold_out", nil, winners, nil)
 	return winnerSeat, total
 }

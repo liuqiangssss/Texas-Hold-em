@@ -41,7 +41,7 @@ func newSeatedTable(t *testing.T, n int) [MaxSeats]*Player {
 
 func TestPreflopBlindsAndFirstAct(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, err := newHand("h1", 0 /* button */, [2]int{5, 10}, fixedDeck(), players)
+	h, err := newHand("h1", "", 0 /* button */, [2]int{5, 10}, fixedDeck(), players)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestPreflopBlindsAndFirstAct(t *testing.T) {
 
 func TestSimpleAllFoldEndsHand(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 
 	// seat 0 (UTG) folds, seat 1 (SB) folds — seat 2 (BB) wins.
@@ -82,7 +82,7 @@ func TestSimpleAllFoldEndsHand(t *testing.T) {
 
 func TestRaiseAndCallProgressesStreet(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 
 	// seat 0 raises to 30, seat 1 calls, seat 2 calls.
@@ -107,7 +107,7 @@ func TestRaiseAndCallProgressesStreet(t *testing.T) {
 
 func TestIllegalCheckWhenFacingBet(t *testing.T) {
 	players := newSeatedTable(t, 2)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 	// heads-up: button (0) = SB, acts first preflop facing 5 short of BB.
 	if _, _, err := h.applyAction(0, proto.ActCheck, 0); err == nil {
@@ -117,7 +117,7 @@ func TestIllegalCheckWhenFacingBet(t *testing.T) {
 
 func TestRaiseTooSmall(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 	// UTG raise to 15 (only +5 over BB) — minRaise is 10 → illegal.
 	if _, _, err := h.applyAction(0, proto.ActRaise, 15); err == nil {
@@ -128,7 +128,7 @@ func TestRaiseTooSmall(t *testing.T) {
 func TestShortStackAllInCallNoReopen(t *testing.T) {
 	players := newSeatedTable(t, 3)
 	players[0].Stack = 12 // tiny stack
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 	// UTG (seat 0) all-in for 12 — this is short of a min raise (need 20),
 	// so it should NOT reopen action for already-acted players (none here).
@@ -147,5 +147,184 @@ func TestShortStackAllInCallNoReopen(t *testing.T) {
 	}
 	if h.minRaise != 10 { // unchanged because shortAllIn
 		t.Errorf("minRaise = %d, want 10 (unchanged)", h.minRaise)
+	}
+}
+
+// ---------- S3.7 pre-action resolution ----------
+
+func TestPreActionSetPendingValidation(t *testing.T) {
+	players := newSeatedTable(t, 3)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
+	h.startPreflop()
+
+	// pre_raise_to without amount must be rejected.
+	if err := h.setPending(1, proto.ActPreRaiseTo, 0); err == nil {
+		t.Error("expected error for pre_raise_to with 0 amount")
+	}
+	// Unknown action type must be rejected.
+	if err := h.setPending(1, proto.ActionType("nonsense"), 0); err == nil {
+		t.Error("expected error for unknown pre-action type")
+	}
+	// Folded seat cannot arm.
+	h.seats[1].folded = true
+	if err := h.setPending(1, proto.ActPreCheckFold, 0); err == nil {
+		t.Error("expected error: folded seat cannot arm pre-action")
+	}
+}
+
+func TestPreActionCheckFoldResolvesToCheck(t *testing.T) {
+	players := newSeatedTable(t, 3)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
+	h.startPreflop()
+	// Get past preflop into a clean flop with no bet.
+	if _, _, err := h.applyAction(0, proto.ActFold, 0); err != nil {
+		t.Fatal(err)
+	}
+	h.advance()
+	// SB completes, BB checks → preflop closed
+	if _, _, err := h.applyAction(1, proto.ActCall, 0); err != nil {
+		t.Fatal(err)
+	}
+	h.advance()
+	if _, _, err := h.applyAction(2, proto.ActCheck, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !h.roundClosed() {
+		t.Fatal("round should be closed after BB checks")
+	}
+	// Force advance to flop without going through Table actor.
+	h.dealStreet()
+	h.resetForNextStreet()
+
+	// Seat 1 (SB) is first to act on flop with no bet. Seat 2 (BB) arms
+	// pre_check_fold. When toAct switches to seat 2 it should resolve to check.
+	if err := h.setPending(2, proto.ActPreCheckFold, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.applyAction(1, proto.ActCheck, 0); err != nil {
+		t.Fatal(err)
+	}
+	h.advance()
+	if h.toAct != 2 {
+		t.Fatalf("toAct = %d, want 2", h.toAct)
+	}
+	action, amount, ok := h.resolvePending(2)
+	if !ok {
+		t.Fatal("pre-action should resolve")
+	}
+	if action != proto.ActCheck || amount != 0 {
+		t.Errorf("got (%s, %d), want (check, 0)", action, amount)
+	}
+}
+
+func TestPreActionCheckFoldResolvesToFoldFacingBet(t *testing.T) {
+	players := newSeatedTable(t, 3)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
+	h.startPreflop()
+	// Seat 1 (SB) arms pre_check_fold pre-flop while seat 0 (UTG) is to act.
+	if err := h.setPending(1, proto.ActPreCheckFold, 0); err != nil {
+		t.Fatal(err)
+	}
+	// UTG raises — SB now faces a bet.
+	if _, _, err := h.applyAction(0, proto.ActRaise, 30); err != nil {
+		t.Fatal(err)
+	}
+	h.advance()
+	if h.toAct != 1 {
+		t.Fatalf("toAct = %d, want 1", h.toAct)
+	}
+	action, _, ok := h.resolvePending(1)
+	if !ok {
+		t.Fatal("pre-action should resolve to fold")
+	}
+	if action != proto.ActFold {
+		t.Errorf("got %s, want fold", action)
+	}
+}
+
+func TestPreActionCallAnyAlwaysCalls(t *testing.T) {
+	players := newSeatedTable(t, 3)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
+	h.startPreflop()
+
+	if err := h.setPending(2, proto.ActPreCallAny, 0); err != nil {
+		t.Fatal(err)
+	}
+	// UTG raises huge → BB call_any should still resolve to call.
+	if _, _, err := h.applyAction(0, proto.ActRaise, 100); err != nil {
+		t.Fatal(err)
+	}
+	h.advance()
+	if _, _, err := h.applyAction(1, proto.ActFold, 0); err != nil {
+		t.Fatal(err)
+	}
+	h.advance()
+	if h.toAct != 2 {
+		t.Fatalf("toAct = %d", h.toAct)
+	}
+	action, _, ok := h.resolvePending(2)
+	if !ok || action != proto.ActCall {
+		t.Errorf("got (%s, %v), want (call, true)", action, ok)
+	}
+}
+
+func TestPreActionRaiseToApplies(t *testing.T) {
+	players := newSeatedTable(t, 3)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
+	h.startPreflop()
+
+	// Seat 0 (UTG) is first to act. Seat 1 (SB) arms pre_raise_to=40.
+	// UTG just calls → SB's pre-raise should resolve to raise to 40.
+	if err := h.setPending(1, proto.ActPreRaiseTo, 40); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.applyAction(0, proto.ActCall, 0); err != nil {
+		t.Fatal(err)
+	}
+	h.advance()
+	if h.toAct != 1 {
+		t.Fatalf("toAct = %d", h.toAct)
+	}
+	action, amount, ok := h.resolvePending(1)
+	if !ok || action != proto.ActRaise || amount != 40 {
+		t.Errorf("got (%s, %d, %v), want (raise, 40, true)", action, amount, ok)
+	}
+}
+
+func TestPreActionRaiseToDiscardedWhenLevelExceeded(t *testing.T) {
+	players := newSeatedTable(t, 3)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
+	h.startPreflop()
+
+	// SB arms pre_raise_to=40. UTG bumps to 60 → SB's planned raise level
+	// is below currentBet, must be discarded.
+	if err := h.setPending(1, proto.ActPreRaiseTo, 40); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.applyAction(0, proto.ActRaise, 60); err != nil {
+		t.Fatal(err)
+	}
+	h.advance()
+	if _, _, ok := h.resolvePending(1); ok {
+		t.Error("pre_raise_to should be discarded once currentBet >= planned amount")
+	}
+}
+
+func TestPreActionClearRemovesSlot(t *testing.T) {
+	players := newSeatedTable(t, 3)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
+	h.startPreflop()
+
+	if err := h.setPending(1, proto.ActPreCallAny, 0); err != nil {
+		t.Fatal(err)
+	}
+	if h.seats[1].pending == nil {
+		t.Fatal("pending should be set")
+	}
+	if err := h.setPending(1, proto.ActPreClear, 0); err != nil {
+		t.Fatal(err)
+	}
+	if h.seats[1].pending != nil {
+		t.Error("pending should be cleared")
 	}
 }
