@@ -41,7 +41,7 @@ func newSeatedTable(t *testing.T, n int) [MaxSeats]*Player {
 
 func TestPreflopBlindsAndFirstAct(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, err := newHand("h1", 0 /* button */, [2]int{5, 10}, fixedDeck(), players)
+	h, err := newHand("h1", "", 0 /* button */, [2]int{5, 10}, fixedDeck(), players)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestPreflopBlindsAndFirstAct(t *testing.T) {
 
 func TestSimpleAllFoldEndsHand(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 
 	// seat 0 (UTG) folds, seat 1 (SB) folds — seat 2 (BB) wins.
@@ -82,7 +82,7 @@ func TestSimpleAllFoldEndsHand(t *testing.T) {
 
 func TestRaiseAndCallProgressesStreet(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 
 	// seat 0 raises to 30, seat 1 calls, seat 2 calls.
@@ -107,7 +107,7 @@ func TestRaiseAndCallProgressesStreet(t *testing.T) {
 
 func TestIllegalCheckWhenFacingBet(t *testing.T) {
 	players := newSeatedTable(t, 2)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 	// heads-up: button (0) = SB, acts first preflop facing 5 short of BB.
 	if _, _, err := h.applyAction(0, proto.ActCheck, 0); err == nil {
@@ -117,7 +117,7 @@ func TestIllegalCheckWhenFacingBet(t *testing.T) {
 
 func TestRaiseTooSmall(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 	// UTG raise to 15 (only +5 over BB) — minRaise is 10 → illegal.
 	if _, _, err := h.applyAction(0, proto.ActRaise, 15); err == nil {
@@ -128,7 +128,7 @@ func TestRaiseTooSmall(t *testing.T) {
 func TestShortStackAllInCallNoReopen(t *testing.T) {
 	players := newSeatedTable(t, 3)
 	players[0].Stack = 12 // tiny stack
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 	// UTG (seat 0) all-in for 12 — this is short of a min raise (need 20),
 	// so it should NOT reopen action for already-acted players (none here).
@@ -154,7 +154,7 @@ func TestShortStackAllInCallNoReopen(t *testing.T) {
 
 func TestPreActionSetPendingValidation(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 
 	// pre_raise_to without amount must be rejected.
@@ -174,7 +174,7 @@ func TestPreActionSetPendingValidation(t *testing.T) {
 
 func TestPreActionCheckFoldResolvesToCheck(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 	// Get past preflop into a clean flop with no bet.
 	if _, _, err := h.applyAction(0, proto.ActFold, 0); err != nil {
@@ -219,7 +219,7 @@ func TestPreActionCheckFoldResolvesToCheck(t *testing.T) {
 
 func TestPreActionCheckFoldResolvesToFoldFacingBet(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 	// Seat 1 (SB) arms pre_check_fold pre-flop while seat 0 (UTG) is to act.
 	if err := h.setPending(1, proto.ActPreCheckFold, 0); err != nil {
@@ -244,7 +244,7 @@ func TestPreActionCheckFoldResolvesToFoldFacingBet(t *testing.T) {
 
 func TestPreActionCallAnyAlwaysCalls(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 
 	if err := h.setPending(2, proto.ActPreCallAny, 0); err != nil {
@@ -270,7 +270,7 @@ func TestPreActionCallAnyAlwaysCalls(t *testing.T) {
 
 func TestPreActionRaiseToApplies(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 
 	// Seat 0 (UTG) is first to act. Seat 1 (SB) arms pre_raise_to=40.
@@ -293,7 +293,7 @@ func TestPreActionRaiseToApplies(t *testing.T) {
 
 func TestPreActionRaiseToDiscardedWhenLevelExceeded(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 
 	// SB arms pre_raise_to=40. UTG bumps to 60 → SB's planned raise level
@@ -312,7 +312,7 @@ func TestPreActionRaiseToDiscardedWhenLevelExceeded(t *testing.T) {
 
 func TestPreActionClearRemovesSlot(t *testing.T) {
 	players := newSeatedTable(t, 3)
-	h, _ := newHand("h1", 0, [2]int{5, 10}, fixedDeck(), players)
+	h, _ := newHand("h1", "", 0, [2]int{5, 10}, fixedDeck(), players)
 	h.startPreflop()
 
 	if err := h.setPending(1, proto.ActPreCallAny, 0); err != nil {

@@ -10,6 +10,7 @@ import (
 	"github.com/liuqiangssss/texas-holdem/server/internal/deck"
 	"github.com/liuqiangssss/texas-holdem/server/internal/eval"
 	"github.com/liuqiangssss/texas-holdem/server/internal/proto"
+	"github.com/liuqiangssss/texas-holdem/server/internal/store"
 )
 
 const MaxSeats = 6
@@ -130,7 +131,17 @@ type Table struct {
 	turnSeat     int
 	turnStartAt  time.Time
 	turnBudgetMs int // base + bank used to size the timer
+
+	// store is the hand-history sink. May be nil for legacy tests that
+	// construct Table directly via New() — the recording path no-ops in
+	// that case.
+	store store.HandHistoryStore
 }
+
+// handHistorySaveTimeout caps each background SaveHand call so a slow Mongo
+// can't pile up goroutines. 2 seconds is roomy compared to the typical
+// single-document write but short enough to keep the table actor decoupled.
+const handHistorySaveTimeout = 2 * time.Second
 
 func New(blinds [2]int) *Table {
 	return &Table{
@@ -439,7 +450,7 @@ func (t *Table) startHand() {
 	d := deck.NewDeck()
 	deck.Shuffle(d)
 	hid := uuid.NewString()
-	h, err := newHand(hid, t.button, t.Blinds, d, participants)
+	h, err := newHand(hid, t.ID, t.button, t.Blinds, d, participants)
 	if err != nil {
 		log.Printf("[table %s] start_hand: %v", t.ID[:8], err)
 		return
@@ -797,6 +808,7 @@ func (t *Table) endByFoldOut() {
 		Reason:   "fold_out",
 		NextIn:   int(handEndDelay / time.Millisecond),
 	})
+	t.persistHandRecord()
 	t.scheduleAfter(handEndDelay, endHandCmd{handID: t.hand.id})
 }
 
@@ -817,7 +829,25 @@ func (t *Table) settleAndBroadcast() {
 		Reason:   "showdown",
 		NextIn:   int(handEndDelay / time.Millisecond),
 	})
+	t.persistHandRecord()
 	t.scheduleAfter(handEndDelay, endHandCmd{handID: h.id})
+}
+
+// persistHandRecord ships the finalized hand record to the configured store
+// without blocking the table actor. Failures are logged but never propagate
+// back into game state — broken persistence must not stall the next hand.
+func (t *Table) persistHandRecord() {
+	if t.store == nil || t.hand == nil || t.hand.record == nil {
+		return
+	}
+	rec := t.hand.record
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), handHistorySaveTimeout)
+		defer cancel()
+		if err := t.store.SaveHand(ctx, rec); err != nil {
+			log.Printf("[table %s] save hand %s: %v", t.ID[:8], rec.HandID[:8], err)
+		}
+	}()
 }
 
 func (t *Table) broadcastPotUpdate() {
